@@ -39,6 +39,8 @@ input[type="checkbox"] { accent-color: var(--eye); }
 button.link { background: none; border: 0; padding: 0; color: var(--eye); text-decoration: underline; }
 :focus-visible { outline: 2px solid var(--eye); outline-offset: 2px; }
 
+.gate { display: flex; gap: 8px; margin: 12px 0 6px; max-width: 360px; }
+.gate input { flex: 1; font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--edge); border-radius: 8px; padding: 8px 12px; min-width: 0; }
 .cards { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); margin-top: 14px; }
 .card { display: block; text-align: left; width: 100%; padding: 14px; border-radius: 12px; }
 .card:hover { border-color: var(--eye); }
@@ -171,10 +173,67 @@ function percent(share) {
   return `${Math.round(share * 100)}%`;
 }
 
-async function load(path) {
+async function fetchJson(path) {
   const response = await fetch(`${path}?v=${Date.now()}`); // always the latest publish
   if (!response.ok) throw new Error(String(response.status));
   return response.json();
+}
+
+// ------------------------------------------------------------------ password
+// When the site has a password, every data file is encrypted (see driftscout/lock.py) and
+// lock.json says how to turn the password into the key. Checking the password IS decrypting:
+// there is nothing here that could be skipped to get at the matches.
+
+let key = null; // the decryption key, once the right password has been given
+
+function bytes(base64) {
+  return Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
+}
+
+async function keyFrom(password, how) {
+  const material = await crypto.subtle.importKey("raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveKey"]);
+  return crypto.subtle.deriveKey({ name: "PBKDF2", hash: how.hash, salt: bytes(how.salt), iterations: how.iterations }, material, { name: "AES-GCM", length: 256 }, false, ["decrypt"]);
+}
+
+async function unseal(sealed, withKey) {
+  const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: bytes(sealed.iv) }, withKey, bytes(sealed.data));
+  return JSON.parse(new TextDecoder().decode(plain));
+}
+
+async function load(path) {
+  const body = await fetchJson(path);
+  return body && body.locked ? unseal(body, key) : body;
+}
+
+// True when the matches can be read: no password on the site, or the right one was given.
+async function unlocked() {
+  if (key) return true;
+  let how;
+  try { how = await fetchJson("lock.json"); } catch (e) { return true; } // no lock file: an open site
+  const attempt = async (password) => {
+    const candidate = await keyFrom(password, how);
+    await unseal(await fetchJson("matches.json"), candidate); // throws on a wrong password
+    key = candidate;
+    remember("film-pass", password);
+  };
+  if (remember("film-pass")) {
+    try { await attempt(remember("film-pass")); return true; } catch (e) { /* the password has changed since */ }
+  }
+  const input = el("input", { type: "password", "aria-label": "Password", autocomplete: "current-password", placeholder: "Password" });
+  const note = el("p", { class: "muted small", role: "status" });
+  const button = el("button", { type: "submit" }, "Open");
+  app.replaceChildren(
+    el("h1", null, "This film is private"),
+    el("p", { class: "muted" }, "Ask your captain for the password."),
+    el("form", { class: "gate", onsubmit: async (e) => {
+      e.preventDefault();
+      button.disabled = true;
+      note.textContent = "Checking...";
+      try { await attempt(input.value); route(); } catch (err) { note.textContent = "That password didn't open it."; button.disabled = false; input.select(); }
+    } }, input, button),
+    note);
+  input.focus();
+  return false;
 }
 
 function remember(key, value) {
@@ -494,9 +553,11 @@ async function showMatch(slug, who) {
   ticker = setInterval(tick, 300);
 }
 
-function route() {
+async function route() {
   clearInterval(ticker);
   view = null;
+  crumb.textContent = "";
+  if (!(await unlocked())) return; // the password form is showing; it calls route() again
   const [slug, who] = location.hash.replace(/^#/, "").split("/");
   if (!slug) return showList();
   let name = "";
